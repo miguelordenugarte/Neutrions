@@ -89,7 +89,7 @@ calibration:
 
 # ── Threshold selection ───────────────────────────────────────────────────────
 threshold:
-  # strategy: f1 | cost | gmean
+  # strategy: f1 | cost | gmean | significance | asimov | punzi | fixed_efficiency
   strategy:      "cost"
 
   # Used only when strategy = "cost"
@@ -99,6 +99,8 @@ threshold:
 
   # Number of candidate thresholds swept during search
   n_steps:       500
+  punzi_a: 3.0
+  target_efficiency: 0.95
 
 
 # ── Outputs ───────────────────────────────────────────────────────────────────

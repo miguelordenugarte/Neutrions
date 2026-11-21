@@ -7,14 +7,19 @@ The default threshold of 0.5 is almost never optimal when classes are
 imbalanced or when false negatives and false positives carry different costs.
 Use the functions here to find a principled operating point after calibration.
 
-Two strategies are provided:
+Supported strategies:
 
-* ``optimal_f1_threshold``   — maximises F1 score on a validation set.
-* ``optimal_cost_threshold`` — minimises a user-defined business cost
-                               (weighted FP + FN).
+* ``optimal_f1_threshold``       — maximises F1.
+* ``optimal_gmean_threshold``    — maximises sensitivity × specificity.
+* ``optimal_cost_threshold``     — minimises weighted FP and FN cost.
+* ``optimal_significance_threshold`` — maximises S / sqrt(S + B).
+* ``optimal_asimov_threshold``   — maximises the Asimov significance Z_A.
+* ``optimal_punzi_threshold``    — maximises efficiency / (punzi_a/2 + sqrt(B)).
+* ``optimal_fixed_efficiency_threshold`` — selects the highest threshold with recall
+                                           at or above the target efficiency.
 
-Both operate on a held-out validation or calibration split — never on the
-test set — and return a single float threshold ready for deployment.
+All strategies operate on held-out validation or calibration probabilities,
+never on the test split, and return a single float threshold ready for deployment.
 """
 
 from __future__ import annotations
@@ -153,3 +158,93 @@ def optimal_gmean_threshold(
 
     best_idx = int(np.argmax(g_means))
     return float(thresholds[best_idx]), float(g_means[best_idx])
+
+
+def optimal_significance_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_steps: int = 500,
+) -> tuple[float, float]:
+    """Maximise S / sqrt(S + B), where S and B are thresholded counts."""
+    thresholds = np.linspace(0.0, 1.0, n_steps)
+    scores: list[float] = []
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        signal = int(((y_pred == 1) & (y_true == 1)).sum())
+        background = int(((y_pred == 1) & (y_true == 0)).sum())
+        denominator = np.sqrt(signal + background)
+        scores.append(float(signal / denominator) if denominator > 0 else 0.0)
+    best_idx = int(np.argmax(scores))
+    return float(thresholds[best_idx]), float(scores[best_idx])
+
+
+def optimal_asimov_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_steps: int = 500,
+    background_floor: float = 1e-12,
+) -> tuple[float, float]:
+    """Maximise the Asimov significance Z_A."""
+    thresholds = np.linspace(0.0, 1.0, n_steps)
+    scores: list[float] = []
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        signal = float(((y_pred == 1) & (y_true == 1)).sum())
+        background = float(((y_pred == 1) & (y_true == 0)).sum())
+        background = max(background, background_floor)
+        if signal + background <= 0:
+            scores.append(0.0)
+            continue
+        inner = (signal + background) * np.log1p(signal / background) - signal
+        scores.append(float(np.sqrt(max(2.0 * inner, 0.0))))
+    best_idx = int(np.argmax(scores))
+    return float(thresholds[best_idx]), float(scores[best_idx])
+
+
+def optimal_punzi_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    punzi_a: float = 3.0,
+    n_steps: int = 500,
+) -> tuple[float, float]:
+    """Maximise signal efficiency divided by punzi_a/2 + sqrt(background)."""
+    if not np.isfinite(punzi_a) or punzi_a < 0:
+        raise ValueError("punzi_a must be finite and non-negative.")
+    total_signal = int((y_true == 1).sum())
+    thresholds = np.linspace(0.0, 1.0, n_steps)
+    scores: list[float] = []
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        signal = int(((y_pred == 1) & (y_true == 1)).sum())
+        background = int(((y_pred == 1) & (y_true == 0)).sum())
+        efficiency = signal / total_signal if total_signal > 0 else 0.0
+        denominator = punzi_a / 2.0 + np.sqrt(background)
+        scores.append(float(efficiency / denominator) if denominator > 0 else 0.0)
+    best_idx = int(np.argmax(scores))
+    return float(thresholds[best_idx]), float(scores[best_idx])
+
+
+def optimal_fixed_efficiency_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    target_efficiency: float = 0.95,
+    n_steps: int = 500,
+) -> tuple[float, float]:
+    """Select the highest threshold whose recall is at least target_efficiency."""
+    if not np.isfinite(target_efficiency) or not 0.0 <= target_efficiency <= 1.0:
+        raise ValueError("target_efficiency must be finite and within [0, 1].")
+    total_signal = int((y_true == 1).sum())
+    if total_signal == 0:
+        return 1.0, 0.0
+    thresholds = np.linspace(0.0, 1.0, n_steps)
+    eligible: list[tuple[float, float]] = []
+    for threshold in thresholds:
+        y_pred = (y_prob >= threshold).astype(int)
+        signal = int(((y_pred == 1) & (y_true == 1)).sum())
+        recall = signal / total_signal
+        if recall >= target_efficiency:
+            eligible.append((float(threshold), float(recall)))
+    if eligible:
+        threshold, recall = eligible[-1]
+        return threshold, recall
+    return 1.0, 0.0

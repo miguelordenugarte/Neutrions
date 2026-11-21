@@ -15,7 +15,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from models.base_model import BaseModel
-from trainer import _chronological_time_block_split, _load_data, run
+from trainer import (
+    _chronological_time_block_split,
+    _load_data,
+    _load_false_training_data,
+    _oof_calibrated_probabilities,
+    run,
+)
 
 
 class GroupedSplitTests(unittest.TestCase):
@@ -133,6 +139,61 @@ class GroupedSplitTests(unittest.TestCase):
             80 not in X_split[:, 0].astype(int)
             for X_split, _ in splits.values()
         ))
+
+    def test_false_ibd_rows_are_dropped_from_false_training_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            features_path = temp_path / "false_features.parquet"
+            labels_path = temp_path / "false_labels.parquet"
+            false_features = pd.DataFrame({
+                "E_1": [1.0, 2.0, 3.0],
+                "t_1": [500.0, 1500.0, 2500.0],
+            })
+            false_labels = pd.DataFrame({
+                "is_ibd": [0, 0, 0],
+                "false_ibd": [0, 1, 0],
+                "event_id_1": [1, 2, 3],
+                "event_id_2": [4, 5, 6],
+                "time_block_id_1": [0, 1, 2],
+                "time_block_id_2": [0, 1, 2],
+            })
+            pq.write_table(
+                pa.Table.from_pandas(false_features, preserve_index=False),
+                features_path,
+            )
+            pq.write_table(
+                pa.Table.from_pandas(false_labels, preserve_index=False),
+                labels_path,
+            )
+            config = {
+                "data": {
+                    "features_path": str(features_path),
+                    "labels_path": str(labels_path),
+                    "false_features_path": str(features_path),
+                    "false_labels_path": str(labels_path),
+                    "target_col": "is_ibd",
+                    "positive_label": 1,
+                    "split_strategy": "chronological_time_blocks",
+                },
+                "features": {"include": ["E_1"], "exclude": []},
+            }
+            X, y, metadata = _load_false_training_data(
+                config, ["E_1"]
+            )
+
+        self.assertEqual(len(y), 2)
+        self.assertTrue(np.all(y == 0))
+        self.assertEqual(X[:, 0].tolist(), [1.0, 3.0])
+        self.assertEqual(metadata["event_id_1"].tolist(), [1, 3])
+
+    def test_oof_calibration_uses_fold_specific_calibrators(self) -> None:
+        raw = np.array([0.1, 0.2, 0.7, 0.8, 0.3, 0.9])
+        y = np.array([0, 0, 1, 1, 0, 1])
+        blocks = np.array([0, 0, 1, 1, 2, 2])
+        oof = _oof_calibrated_probabilities(raw, y, "platt", blocks)
+        self.assertEqual(oof.shape, raw.shape)
+        self.assertTrue(np.isfinite(oof).all())
+        self.assertTrue(np.all((oof >= 0.0) & (oof <= 1.0)))
 
     def test_training_only_pairs_are_excluded_from_evaluation_splits(self) -> None:
         event_count = len(self.labels_df)

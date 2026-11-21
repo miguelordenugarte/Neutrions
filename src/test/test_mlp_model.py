@@ -71,10 +71,32 @@ class MLPModelTests(unittest.TestCase):
         self.assertEqual(MLPModel._learning_rate_patience(2), 1)
         self.assertEqual(MLPModel._learning_rate_patience(10), 3)
 
+    def test_resolve_params_reconstructs_optuna_parameters(self) -> None:
+        resolved = MLPModel.resolve_params({
+            "n_layers": 3,
+            "units_l0": 128,
+            "units_l1": 64,
+            "units_l2": 32,
+            "use_l2": False,
+            "l2": 0.01,
+            "activation": "relu",
+        })
+        self.assertEqual(resolved["hidden_units"], [128, 64, 32])
+        self.assertEqual(resolved["l2"], 0.0)
+
+        direct = MLPModel.resolve_params({
+            "hidden_units": [16, 8],
+            "use_l2": True,
+            "l2": 0.002,
+        })
+        self.assertEqual(direct["hidden_units"], [16, 8])
+        self.assertEqual(direct["l2"], 0.002)
+
     def test_save_and_load_preserve_params_and_predictions(self) -> None:
         model = MLPModel(self.params).fit(
             self.X_train, self.y_train, self.X_val, self.y_val
         )
+        model.feature_names = ["f0", "f1", "f2", "f3"]
         expected = model.predict_proba(self.X_val)
         with tempfile.TemporaryDirectory() as temp_dir:
             model.save(Path(temp_dir))
@@ -82,6 +104,7 @@ class MLPModelTests(unittest.TestCase):
             actual = restored.predict_proba(self.X_val)
 
         self.assertEqual(restored.params, self.params)
+        self.assertEqual(restored.feature_names, ["f0", "f1", "f2", "f3"])
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 

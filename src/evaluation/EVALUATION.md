@@ -35,11 +35,7 @@ Returns a dict with the following entries:
 
 #### PR-AUC (primary metric)
 
-Area under the Precision-Recall curve. Precision and recall are computed at every unique predicted probability value, tracing a curve from $(R=0, P=1)$ to $(R=1, P=\text{prevalence})$. The area is estimated by the trapezoidal rule:
-
-$$\text{PR-AUC} = \sum_{k} (R_k - R_{k-1}) \cdot \frac{P_k + P_{k-1}}{2}$$
-
-PR-AUC is the recommended primary metric for imbalanced problems because the PR curve is unaffected by the large number of true negatives. A random classifier achieves PR-AUC $\approx$ prevalence; a perfect classifier achieves 1.0.
+Precision-Recall summary is implemented with scikit-learn's `average_precision_score`, not a trapezoidal area integration. It summarizes precision at every unique predicted probability threshold in a weighted manner. A random classifier achieves approximately the positive class prevalence; a perfect classifier achieves 1.0.
 
 #### ROC-AUC
 

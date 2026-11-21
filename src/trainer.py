@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
 import time
 from datetime import datetime
 from pathlib import Path
@@ -49,10 +50,12 @@ from typing import Any, Optional, Type
 
 import numpy as np
 import optuna
+import tensorflow as tf
+import joblib
 #import pandas as pd
 import pyarrow.parquet as pq
 import yaml
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedShuffleSplit, GroupKFold
 #from sklearn.preprocessing import LabelEncoder
 
 from evaluation import (
@@ -61,8 +64,13 @@ from evaluation import (
     optimal_cost_threshold,
     optimal_f1_threshold,
     optimal_gmean_threshold,
+    optimal_significance_threshold,
+    optimal_asimov_threshold,
+    optimal_punzi_threshold,
+    optimal_fixed_efficiency_threshold,
 )
 from models.base_model import BaseModel
+from models.MLP_model import MLPModel
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -328,6 +336,9 @@ def _chronological_time_block_split(
     seen_event_ids: dict[str, np.ndarray] = {}
     selected_indices: dict[str, np.ndarray] = {}
     for name, indices in row_indices.items():
+        if training_only_mask is not None and name != "train":
+            indices = indices[~training_only_mask[indices]]
+
         event_ids = np.unique(np.concatenate((
             metadata["event_id_1"][indices],
             metadata["event_id_2"][indices],
@@ -339,8 +350,6 @@ def _chronological_time_block_split(
                 )
         seen_event_ids[name] = event_ids
 
-        if training_only_mask is not None and name != "train":
-            indices = indices[~training_only_mask[indices]]
         if len(indices) == 0 or np.unique(y[indices]).size < 2:
             raise ValueError(
                 f"Grouped split {name!r} has {len(indices)} usable rows or only "
@@ -414,6 +423,39 @@ def _load_false_training_data(
             "False-event pairs must all have the configured negative target "
             "label; regenerate the processed false-event labels."
         )
+
+    false_label_path = Path(data_cfg["false_labels_path"])
+    false_label_columns = pq.read_schema(false_label_path).names
+    keep = np.ones(len(y_false), dtype=bool)
+    if "false_ibd" in false_label_columns:
+        false_ibd = pq.read_table(
+            false_label_path, columns=["false_ibd"]
+        ).to_pandas()["false_ibd"].to_numpy()
+        if len(false_ibd) != len(y_false):
+            raise ValueError(
+                "false_ibd row count differs from false-event feature/target rows."
+            )
+        keep = false_ibd == 0
+        dropped = int((~keep).sum())
+        if dropped:
+            log.info(
+                "Dropped %d contaminated false-event rows where false_ibd != 0.",
+                dropped,
+            )
+        X_false = X_false[keep]
+        y_false = y_false[keep]
+        metadata = {
+            key: values[keep]
+            for key, values in metadata.items()
+        }
+    if len(y_false) == 0:
+        raise ValueError(
+            "False-event training data is empty after false_ibd == 0 filtering."
+        )
+    if np.any(y_false != 0):
+        raise ValueError(
+            "False-event pairs must all remain negative after false_ibd filtering."
+        )
     return X_false, y_false, metadata
 
 
@@ -444,8 +486,14 @@ def _run_hpo(
 
     def objective(trial: optuna.Trial) -> float:
         params = model_cls.suggest_params(trial)
+        if issubclass(model_cls, MLPModel):
+            params = MLPModel.resolve_params(params)
         model  = model_cls(params)
-        model.fit(X_tr, y_tr, X_vl, y_vl)
+        fit_parameters = inspect.signature(model.fit).parameters
+        if "trial" in fit_parameters:
+            model.fit(X_tr, y_tr, X_vl, y_vl, trial=trial)
+        else:
+            model.fit(X_tr, y_tr, X_vl, y_vl)
         y_prob = model.predict_proba(X_vl)
         scores = evaluate(y_vl, y_prob, threshold=0.5)
         return scores[metric]
@@ -516,12 +564,128 @@ def _select_threshold(
         threshold, best = optimal_gmean_threshold(y_true, y_prob, n_steps)
         log.info("Threshold (G-mean strategy): %.4f  G-mean=%.4f", threshold, best)
 
+    elif strategy == "significance":
+        threshold, best = optimal_significance_threshold(y_true, y_prob, n_steps)
+        log.info("Threshold (significance strategy): %.4f  significance=%.4f", threshold, best)
+
+    elif strategy == "asimov":
+        threshold, best = optimal_asimov_threshold(y_true, y_prob, n_steps)
+        log.info("Threshold (Asimov strategy): %.4f  Z_A=%.4f", threshold, best)
+
+    elif strategy == "punzi":
+        punzi_a = float(t_cfg.get("punzi_a", 3.0))
+        threshold, best = optimal_punzi_threshold(
+            y_true, y_prob, punzi_a=punzi_a, n_steps=n_steps
+        )
+        log.info("Threshold (Punzi strategy): %.4f  figure=%.4f", threshold, best)
+
+    elif strategy == "fixed_efficiency":
+        target_efficiency = float(t_cfg.get("target_efficiency", 0.95))
+        threshold, best = optimal_fixed_efficiency_threshold(
+            y_true, y_prob,
+            target_efficiency=target_efficiency,
+            n_steps=n_steps,
+        )
+        log.info(
+            "Threshold (fixed-efficiency strategy): %.4f  recall=%.4f",
+            threshold, best,
+        )
+
     else:
         raise ValueError(
             f"Unknown threshold strategy {strategy!r}. "
-            "Choose from: cost | f1 | gmean"
+            "Choose from: cost | f1 | gmean | significance | asimov | "
+            "punzi | fixed_efficiency"
         )
     return threshold
+
+
+def _get_calibration_block_ids(
+    metadata: dict[str, np.ndarray],
+    cfg: dict,
+    time_origin: int,
+    training_only_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Recompute calibration rows and return their anchor time-block IDs."""
+    block_1 = metadata["time_block_id_1"].astype(np.int64, copy=False)
+    block_2 = metadata["time_block_id_2"].astype(np.int64, copy=False)
+    occupied = np.unique(np.concatenate((block_1, block_2)))
+    split_names = ["train", "val", "calibration", "test"]
+    fractions = np.asarray([cfg["data"]["splits"][name] for name in split_names], dtype=float)
+    cut_indices = np.floor(np.cumsum(fractions[:-1]) * len(occupied)).astype(int)
+    cut_blocks = occupied[cut_indices]
+    split_1 = np.searchsorted(cut_blocks, block_1, side="right")
+    split_2 = np.searchsorted(cut_blocks, block_2, side="right")
+    same_split = split_1 == split_2
+
+    boundary_guard_ns = int(cfg["data"].get("boundary_guard_ns", 0))
+    block_duration_ns = int(cfg["data"]["block_duration_ns"])
+    cut_times = time_origin + cut_blocks * block_duration_ns
+    safe = np.ones(len(block_1), dtype=bool)
+    for boundary in cut_times:
+        safe &= (
+            (metadata["t_1"] < boundary - boundary_guard_ns)
+            | (metadata["t_1"] >= boundary + boundary_guard_ns)
+        )
+    indices = np.flatnonzero(same_split & safe & (split_1 == 2))
+    if training_only_mask is not None:
+        indices = indices[~training_only_mask[indices]]
+    if len(indices) == 0:
+        raise ValueError("Calibration split is empty when recomputing block IDs.")
+    return block_1[indices]
+
+
+def _oof_calibrated_probabilities(
+    raw_probabilities: np.ndarray,
+    y_true: np.ndarray,
+    calibration_method: str,
+    calibration_block_ids: np.ndarray,
+) -> np.ndarray:
+    """Generate grouped OOF calibrated probabilities on a calibration split."""
+    raw_probabilities = np.asarray(raw_probabilities, dtype=np.float64).ravel()
+    y_true = np.asarray(y_true).ravel()
+    calibration_block_ids = np.asarray(calibration_block_ids).ravel()
+    if len(raw_probabilities) != len(y_true) or len(y_true) != len(calibration_block_ids):
+        raise ValueError("OOF calibration inputs must have identical row counts.")
+
+    unique_blocks = np.unique(calibration_block_ids)
+    oof = np.empty(len(y_true), dtype=np.float64)
+
+    if len(unique_blocks) >= 2:
+        n_splits = min(5, len(unique_blocks))
+        if n_splits >= 2:
+            folds = GroupKFold(n_splits=n_splits).split(
+                raw_probabilities, y_true, groups=calibration_block_ids
+            )
+            for train_indices, heldout_indices in folds:
+                fold_calibrator = get_calibrator(calibration_method)
+                if np.unique(y_true[train_indices]).size < 2:
+                    oof[heldout_indices] = raw_probabilities[heldout_indices]
+                else:
+                    fold_calibrator.fit(
+                        raw_probabilities[train_indices],
+                        y_true[train_indices],
+                    )
+                    oof[heldout_indices] = fold_calibrator.predict(
+                        raw_probabilities[heldout_indices]
+                    )
+            return oof
+
+    # Chronological 50/50 fallback for fewer than two calibration time blocks.
+    cut = len(y_true) // 2
+    if cut == 0 or cut == len(y_true):
+        return raw_probabilities.copy()
+    oof[:cut] = raw_probabilities[:cut]
+    first_calibrator = get_calibrator(calibration_method)
+    if np.unique(y_true[cut:]).size >= 2:
+        first_calibrator.fit(raw_probabilities[cut:], y_true[cut:])
+        oof[:cut] = first_calibrator.predict(raw_probabilities[:cut])
+    oof[cut:] = raw_probabilities[cut:]
+    second_calibrator = get_calibrator(calibration_method)
+    if np.unique(y_true[:cut]).size >= 2:
+        second_calibrator.fit(raw_probabilities[:cut], y_true[:cut])
+        oof[cut:] = second_calibrator.predict(raw_probabilities[cut:])
+    return oof
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -543,12 +707,29 @@ def _save_run(
     calibrator,
     threshold: float,
     metrics:   dict,
+    raw_test_metrics: dict,
+    feature_names: list[str],
+    resolved_params: dict,
+    calibration_method: str,
+    best_params: dict,
     study:     optuna.Study | None,
     cfg:       dict,
 ) -> None:
     """Persist all run artefacts to *run_dir*."""
     if cfg["outputs"].get("save_model", True):
+        if hasattr(model, "feature_names"):
+            model.feature_names = list(feature_names)
         model.save(run_dir / "model")
+        joblib.dump(calibrator, run_dir / "model" / "calibrator.joblib")
+        manifest = {
+            "feature_names": list(feature_names),
+            "dtype": "float32",
+            "calibration_method": calibration_method,
+            "threshold": threshold,
+            "resolved_params": resolved_params,
+        }
+        with open(run_dir / "model" / "inference_config.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
 
     if cfg["outputs"].get("save_metrics", True):
         with open(run_dir / "metrics.json", "w") as f:
@@ -556,7 +737,9 @@ def _save_run(
                 {
                     "threshold": threshold,
                     "test_metrics": metrics,
-                    "best_params": study.best_params if study else {},
+                    "raw_test_metrics": raw_test_metrics,
+                    "best_params": best_params,
+                    "resolved_params": resolved_params,
                 },
                 f,
                 indent=2,
@@ -613,6 +796,7 @@ def run(
     cfg     = load_config(config_path)
     seed    = cfg["data"]["random_seed"]
     np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
 
     model_name = model_cls.__name__
 
@@ -695,15 +879,26 @@ def run(
     if best_params is not None:
         log.info("Using provided best_params — skipping HPO.")
         params = best_params
+        raw_best_params = dict(best_params)
     elif skip_hpo:
         log.info("HPO skipped — using model defaults.")
         params = {}
+        raw_best_params = {}
     else:
         params, study = _run_hpo(model_cls, splits, cfg)
+        raw_best_params = dict(study.best_params)
+
+    if issubclass(model_cls, MLPModel):
+        params = MLPModel.resolve_params(params)
+        resolved_params = dict(params)
+    else:
+        resolved_params = dict(params)
 
     # Keep validation independent because fit uses it for early stopping.
     log.info("Fitting final model on training data with validation early stopping …")
     model = model_cls(params)
+    if hasattr(model, "feature_names"):
+        model.feature_names = list(feature_names)
     model.fit(X_tr, y_tr, X_vl, y_vl)
 
     # ── 5. Calibrate on calibration split ─────────────────────────────────────
@@ -716,16 +911,27 @@ def run(
     log.info("Calibrating probabilities with %s …", cal_method)
     calibrator = get_calibrator(cal_method)
     raw_cal    = model.predict_proba(X_ca)
-    calibrator.fit(raw_cal, y_ca)
-    cal_probs  = calibrator.predict(raw_cal)
+    if split_strategy == "chronological_time_blocks":
+        cal_blocks = _get_calibration_block_ids(
+            split_metadata, cfg, time_origin, training_only_mask
+        )
+    else:
+        cal_blocks = np.zeros(len(y_ca), dtype=np.int64)
+    oof_cal_probs = _oof_calibrated_probabilities(
+        raw_cal, y_ca, cal_method, cal_blocks
+    )
 
     # ── 6. Select operating threshold on calibration split ────────────────────
-    threshold = _select_threshold(y_ca, cal_probs, cfg)
+    threshold = _select_threshold(y_ca, oof_cal_probs, cfg)
+
+    # Refit calibrator on all calibration rows only after OOF threshold selection.
+    calibrator.fit(raw_cal, y_ca)
 
     # ── 7. Final evaluation on test split ─────────────────────────────────────
     raw_test  = model.predict_proba(X_te)
     cal_test  = calibrator.predict(raw_test)
     metrics   = evaluate(y_te, cal_test, threshold=threshold)
+    raw_test_metrics = evaluate(y_te, raw_test, threshold=0.5)
 
     elapsed = time.perf_counter() - t_start
     log.info(
@@ -739,7 +945,20 @@ def run(
 
     # ── 8. Persist artefacts ──────────────────────────────────────────────────
     run_dir = _make_run_dir(model_name, cfg)
-    _save_run(run_dir, model, calibrator, threshold, metrics, study, cfg)
+    _save_run(
+        run_dir,
+        model,
+        calibrator,
+        threshold,
+        metrics,
+        raw_test_metrics,
+        feature_names,
+        resolved_params,
+        cal_method,
+        raw_best_params,
+        study,
+        cfg,
+    )
 
     return {
         "model":      model,

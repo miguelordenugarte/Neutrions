@@ -54,6 +54,23 @@ regularizers = tf.keras.regularizers
 from models.base_model import BaseModel
 
 
+class _OptunaPruningCallback(callbacks.Callback):
+    """Report validation PR-AUC to Optuna after every training epoch."""
+
+    def __init__(self, trial: optuna.Trial) -> None:
+        super().__init__()
+        self.trial = trial
+
+    def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        logs = logs or {}
+        value = logs.get("val_pr_auc")
+        if value is None:
+            return
+        self.trial.report(float(value), step=epoch)
+        if self.trial.should_prune():
+            raise optuna.TrialPruned()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +101,49 @@ class MLPModel(BaseModel):
         super().__init__(params or {})
         self._keras_model: tf.keras.Model | None = None
         self._input_features: int | None = None
+        self.feature_names: list[str] | None = None
+
+    @classmethod
+    def resolve_params(cls, params: dict[str, Any]) -> dict[str, Any]:
+        """Translate flat Optuna parameters into explicit MLP constructor parameters."""
+        resolved = dict(params or {})
+        if "hidden_units" in resolved:
+            hidden_units = resolved["hidden_units"]
+        else:
+            if "n_layers" not in resolved and not any(
+                key.startswith("units_l") for key in resolved
+            ):
+                resolved["hidden_units"] = [256, 128, 64]
+                hidden_units = resolved["hidden_units"]
+            else:
+                n_layers = resolved.get("n_layers", 1)
+                if not isinstance(n_layers, (int, np.integer)) or isinstance(n_layers, bool):
+                    raise ValueError("n_layers must be a positive integer.")
+                n_layers = int(n_layers)
+                hidden_units = []
+                for i in range(n_layers):
+                    units = resolved.get(f"units_l{i}")
+                    if units is None:
+                        raise ValueError(f"Missing units_l{i} for n_layers={n_layers}.")
+                    hidden_units.append(int(units))
+                resolved["hidden_units"] = hidden_units
+
+        if not isinstance(resolved["hidden_units"], (list, tuple)) or not resolved["hidden_units"]:
+            raise ValueError("hidden_units must be a non-empty list of positive integers.")
+        resolved["hidden_units"] = [
+            int(units) for units in resolved["hidden_units"]
+        ]
+        if any(units <= 0 for units in resolved["hidden_units"]):
+            raise ValueError("hidden_units must contain only positive integers.")
+
+        if resolved.get("use_l2") is False:
+            resolved["l2"] = 0.0
+        else:
+            l2 = resolved.get("l2", 0.0)
+            if not isinstance(l2, (int, float, np.number)) or isinstance(l2, bool):
+                raise ValueError("l2 must be finite and non-negative.")
+            resolved["l2"] = float(l2)
+        return resolved
 
     # ── Architecture ──────────────────────────────────────────────────────────
 
@@ -136,6 +196,7 @@ class MLPModel(BaseModel):
         y_train: np.ndarray,
         X_val:   np.ndarray,
         y_val:   np.ndarray,
+        trial: optuna.Trial | None = None,
     ) -> "MLPModel":
         """Train the MLP.
 
@@ -186,6 +247,8 @@ class MLPModel(BaseModel):
                 verbose=0,
             ),
         ]
+        if trial is not None:
+            cb.append(_OptunaPruningCallback(trial))
 
         self._keras_model.fit(
             X_train, y_train,
@@ -212,8 +275,12 @@ class MLPModel(BaseModel):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self._keras_model.save(path / "mlp_model.keras")
+        config = dict(self.params)
+        config["resolved_params"] = dict(self.params)
+        if self.feature_names is not None:
+            config["feature_names"] = list(self.feature_names)
         with open(path / "mlp_config.json", "w", encoding="utf-8") as config_file:
-            json.dump(self.params, config_file, indent=2)
+            json.dump(config, config_file, indent=2)
 
     @classmethod
     def load(cls, path: Path) -> "MLPModel":
@@ -230,7 +297,11 @@ class MLPModel(BaseModel):
                 for label, weight in params["class_weight"].items()
             }
 
+        feature_names = params.get("feature_names")
+        params.pop("feature_names", None)
+        params.pop("resolved_params", None)
         obj = cls(params)
+        obj.feature_names = feature_names
         obj._keras_model = tf.keras.models.load_model(path / "mlp_model.keras")
         obj._input_features = int(obj._keras_model.input_shape[-1])
         return obj

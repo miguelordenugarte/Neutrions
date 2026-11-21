@@ -16,9 +16,9 @@ Tian et al. (2020) — posterior re-calibration for imbalanced datasets.
 from __future__ import annotations
 
 import numpy as np
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
+from scipy.special import expit, logit
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,19 +91,28 @@ class PlattCalibrator(_BaseCalibrator):
 
     def __init__(self, C: float = 1.0) -> None:
         self._model = LogisticRegression(C=C, solver="lbfgs", max_iter=1_000)
+        self.eps = 1e-7
+
+    def _log_odds(self, probabilities: np.ndarray) -> np.ndarray:
+        probabilities = np.asarray(probabilities, dtype=np.float64).ravel()
+        if not np.isfinite(probabilities).all():
+            raise ValueError("Platt input probabilities must be finite.")
+        clipped = np.clip(probabilities,
+                          self.eps, 1.0 - self.eps)
+        return logit(clipped).reshape(-1, 1)
 
     def fit(
         self,
         probabilities: np.ndarray,
         labels: np.ndarray,
     ) -> "PlattCalibrator":
-        self._model.fit(probabilities.ravel().reshape(-1, 1), labels.ravel())
+        self._model.fit(self._log_odds(probabilities), labels.ravel())
         return self
 
     def predict(self, probabilities: np.ndarray) -> np.ndarray:
-        return self._model.predict_proba(
-            probabilities.ravel().reshape(-1, 1)
-        )[:, 1]
+        return expit(
+            self._model.decision_function(self._log_odds(probabilities))
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
