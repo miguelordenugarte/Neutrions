@@ -13,6 +13,7 @@ Accuracy is deliberately excluded: it is misleading under class imbalance.
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.distance import jensenshannon
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -23,6 +24,105 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+
+
+def compute_spectral_distortion(
+    energies_all: np.ndarray,
+    energies_selected: np.ndarray,
+    bins: int | np.ndarray = 50,
+    energy_range: tuple[float, float] | None = None,
+) -> dict[str, float]:
+    """Measure prompt-energy shape changes caused by an event selection.
+
+    Histograms use identical edges and are separately normalized to unit
+    probability. ``reduced_chi2`` is a descriptive normalized-shape statistic:
+    ``sum((Q_i - P_i)**2 / P_i) / (n_populated_bins - 1)`` over bins with
+    ``P_i > 0``; it is not an inferential chi-square test because normalized
+    bins are statistically dependent. The relative efficiency deviation is
+    ``max(abs(epsilon_i - epsilon_global) / epsilon_global)`` for bins with at
+    least 20 unselected true signal events.
+
+    If the selection is empty, the shape metrics are undefined and returned as
+    NaN. Energies are expected to be prompt energies for true signal pairs.
+    """
+    all_energy = np.asarray(energies_all, dtype=np.float64).ravel()
+    selected_energy = np.asarray(energies_selected, dtype=np.float64).ravel()
+    nan_metrics = {
+        "js_distance": float("nan"),
+        "reduced_chi2": float("nan"),
+        "max_relative_efficiency_deviation": float("nan"),
+    }
+
+    if not np.isfinite(all_energy).all() or not np.isfinite(selected_energy).all():
+        raise ValueError("Energy arrays must contain only finite values.")
+    if all_energy.size == 0 or selected_energy.size == 0:
+        return nan_metrics
+
+    if energy_range is None:
+        low = float(np.min(all_energy))
+        high = float(np.max(all_energy))
+        if low == high:
+            low -= 0.5
+            high += 0.5
+        histogram_range = (low, high)
+        bin_edges: int | np.ndarray = bins
+    else:
+        low, high = map(float, energy_range)
+        if not np.isfinite([low, high]).all() or low >= high:
+            raise ValueError("energy_range must contain finite values with low < high.")
+        histogram_range = (low, high)
+        bin_edges = bins
+
+    if isinstance(bins, (int, np.integer)) and bins <= 0:
+        raise ValueError("bins must be a positive integer or increasing edge array.")
+    if not isinstance(bins, (int, np.integer)):
+        edge_array = np.asarray(bins, dtype=np.float64)
+        if (
+            edge_array.ndim != 1
+            or len(edge_array) < 2
+            or not np.isfinite(edge_array).all()
+            or np.any(np.diff(edge_array) <= 0)
+        ):
+            raise ValueError("bins must be a positive integer or increasing edge array.")
+        bin_edges = edge_array
+        histogram_range = None
+
+    all_counts, edges = np.histogram(
+        all_energy, bins=bin_edges, range=histogram_range
+    )
+    selected_counts, _ = np.histogram(
+        selected_energy, bins=edges
+    )
+    total_all = int(all_counts.sum())
+    total_selected = int(selected_counts.sum())
+    if total_all == 0 or total_selected == 0:
+        return nan_metrics
+
+    p = all_counts.astype(np.float64) / total_all
+    q = selected_counts.astype(np.float64) / total_selected
+    populated = p > 0
+    chi_bins = int(populated.sum())
+    reduced_chi2 = (
+        float(np.sum((q[populated] - p[populated]) ** 2 / p[populated]) / (chi_bins - 1))
+        if chi_bins > 1
+        else float("nan")
+    )
+
+    global_efficiency = total_selected / total_all
+    efficiency_bins = all_counts >= 20
+    if global_efficiency > 0 and np.any(efficiency_bins):
+        bin_efficiencies = selected_counts[efficiency_bins] / all_counts[efficiency_bins]
+        max_relative_deviation = float(
+            np.max(np.abs(bin_efficiencies - global_efficiency)) / global_efficiency
+        )
+    else:
+        max_relative_deviation = float("nan")
+
+    return {
+        "js_distance": float(jensenshannon(p, q, base=2)),
+        "reduced_chi2": reduced_chi2,
+        "max_relative_efficiency_deviation": max_relative_deviation,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

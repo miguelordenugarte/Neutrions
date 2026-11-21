@@ -33,6 +33,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from constants import (
+    DETECTOR_HALF_HEIGHT_M,
+    DETECTOR_RADIUS_M,
+    PAIR_THRESHOLD_NS,
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,9 +73,6 @@ EVENT_COLS_TOTAL = [
 
 RAW_LABEL_COLS    = ["pair_id", "label", "label_name"]
 LABEL_COLS_TOTAL  = RAW_LABEL_COLS + ["event_id", "time_block_id"]
-PAIR_THRESHOLD_NS = 10 * 200_000   # 2 ms expressed in nanoseconds
-DETECTOR_RADIUS_M = 1.5 # Radius of the instrument in meters 
-DETECTOR_HALF_HEIGHT_M = 1.55 #height of the instrument in meters 
 #: Number of completed pairs accumulated in memory before flushing to disk.
 FLUSH_EVERY = 500_000
 

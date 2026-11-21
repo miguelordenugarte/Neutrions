@@ -69,6 +69,7 @@ from evaluation import (
     optimal_punzi_threshold,
     optimal_fixed_efficiency_threshold,
 )
+from features import DERIVED_FEATURE_SOURCES, augment_derived_features
 from models.base_model import BaseModel
 from models.MLP_model import MLPModel
 
@@ -141,7 +142,10 @@ def _load_data(
     include = cfg["features"].get("include") or []
     exclude = cfg["features"].get("exclude") or []
     if include:
-        missing = [column for column in include if column not in feature_columns]
+        missing = [
+            column for column in include
+            if column not in feature_columns and column not in DERIVED_FEATURE_SOURCES
+        ]
         if missing:
             raise ValueError(
                 f"Configured feature columns are missing from {feat_path}: "
@@ -155,9 +159,21 @@ def _load_data(
     if not selected_features:
         raise ValueError("Feature selection produced no model input columns.")
 
+    feature_read_columns = []
+    for column in selected_features:
+        sources = DERIVED_FEATURE_SOURCES.get(column, (column,))
+        feature_read_columns.extend(source for source in sources if source not in feature_read_columns)
+    missing_sources = [
+        column for column in feature_read_columns if column not in feature_columns
+    ]
+    if missing_sources:
+        raise ValueError(
+            f"Feature source columns are missing from {feat_path}: "
+            + ", ".join(missing_sources)
+        )
+
     metadata = None
     metadata_columns: list[str] = []
-    feature_read_columns = list(selected_features)
     if split_strategy == "chronological_time_blocks":
         metadata_columns = [
             "event_id_1", "event_id_2",
@@ -197,6 +213,7 @@ def _load_data(
 
     # Keep split metadata out of the model input even when t_1 was read for
     # chronological splitting but is not part of the configured feature list.
+    X_df = augment_derived_features(X_df, selected_features)
     X_df = X_df[selected_features]
     feature_names = X_df.columns.tolist()
 
@@ -282,11 +299,16 @@ def _chronological_time_block_split(
     cfg: dict,
     time_origin: int,
     training_only_mask: np.ndarray | None = None,
+    return_splits: tuple[str, ...] | None = None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Split by whole time blocks, optionally keeping rows only in training."""
+    """Split by whole time blocks, optionally returning selected splits only."""
     data_cfg = cfg["data"]
     ratios = data_cfg["splits"]
     split_names = ["train", "val", "calibration", "test"]
+    if return_splits is not None:
+        unknown_splits = set(return_splits).difference(split_names)
+        if unknown_splits:
+            raise ValueError(f"Unknown requested split names: {sorted(unknown_splits)}.")
     fractions = np.asarray([ratios[name] for name in split_names], dtype=float)
 
     if np.any(fractions <= 0) or not np.isclose(fractions.sum(), 1.0):
@@ -382,9 +404,11 @@ def _chronological_time_block_split(
             heldout_training_only,
         )
 
+    returned_splits = split_names if return_splits is None else return_splits
     return {
         name: (X[indices], y[indices])
         for name, indices in selected_indices.items()
+        if name in returned_splits
     }
 
 
